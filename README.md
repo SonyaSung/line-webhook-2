@@ -55,3 +55,27 @@ Expected response: `ok`
 - OCR only runs when sender is in `ALLOWED_USER_IDS`.
 - Non-text or non-keyword messages reply `已收到`.
 - Reply API errors are logged; webhook still returns `200 ok`.
+
+## Debug Logs For OCR
+
+- Startup logs print:
+  - `APP_VERSION`
+  - `OCR_ENABLED` raw value and parsed boolean
+  - `OCR_MAX_IMAGES_PER_DAY`
+  - `ALLOWED_USER_IDS` count only
+  - `SUGGESTION_COUNT`
+  - `DB_PATH`
+- Event logs print:
+  - `event.type`
+  - `message.type`
+  - whether `source.userId` exists
+  - `isAllowedUser`
+  - matched flow branch
+- OCR image logs print:
+  - image branch entered
+  - LINE content download start/success/fail with status
+  - downloaded image byte size
+  - vision client init success/fail
+  - OCR success text length or empty result
+  - quota check result (`todayCount`, `max`, `allowed`)
+  - final response branch (`2 suggestions` or fallback)
