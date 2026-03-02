@@ -15,7 +15,15 @@ const lineChannelSecret = process.env.LINE_CHANNEL_SECRET || "";
 const timezone = process.env.TZ || "UTC";
 const appVersion = process.env.APP_VERSION || process.env.npm_package_version || "dev";
 const BUILD_FINGERPRINT = process.env.BUILD_FINGERPRINT || "dev-local";
-const MODEL_NAME = process.env.MODEL_NAME || process.env.OPENCLAW_MODEL || "unknown";
+
+const AI_PROVIDER = String(process.env.AI_PROVIDER || "openai")
+  .trim()
+  .toLowerCase();
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || process.env.AI_MODEL || "gpt-4o-mini";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+
 const suggestionCount = Number.parseInt(process.env.SUGGESTION_COUNT || "2", 10);
 const resolveKeywords = (process.env.RESOLVE_KEYWORDS || "#定稿,#okok")
   .split(",")
@@ -45,10 +53,8 @@ function normalizeUserIdToken(value) {
 
 function parseAllowedUserIds(raw) {
   if (!raw || !String(raw).trim()) return [];
-
   const input = String(raw).trim();
   let parsedValues = [];
-
   if (input.startsWith("[") && input.endsWith("]")) {
     try {
       const parsed = JSON.parse(input);
@@ -59,7 +65,6 @@ function parseAllowedUserIds(raw) {
   } else {
     parsedValues = input.split(",");
   }
-
   return Array.from(new Set(parsedValues.map((x) => normalizeUserIdToken(x)).filter(Boolean)));
 }
 
@@ -75,9 +80,27 @@ function formatError(err) {
   return stack ? `${message} | ${stack}` : message;
 }
 
+function getAiConfig() {
+  if (AI_PROVIDER === "gemini") {
+    return {
+      provider: "gemini",
+      model: GEMINI_MODEL || "gemini-2.0-flash",
+      apiKey: GEMINI_API_KEY,
+      apiKeyPresent: Boolean(GEMINI_API_KEY),
+    };
+  }
+  return {
+    provider: "openai",
+    model: OPENAI_MODEL || "gpt-4o-mini",
+    apiKey: OPENAI_API_KEY,
+    apiKeyPresent: Boolean(OPENAI_API_KEY),
+  };
+}
+
 const ocrEnabled = parseBoolean(ocrEnabledRaw);
 const allowedUserIds = parseAllowedUserIds(allowedUserIdsRaw);
 const allowedUserIdSet = new Set(allowedUserIds);
+const aiConfig = getAiConfig();
 
 function openDb() {
   const dbDir = path.dirname(dbPath);
@@ -145,7 +168,6 @@ async function tryConsumeOcrQuota() {
   const row = await dbGet("SELECT image_count FROM ocr_daily_usage WHERE date_key = ?", [dateKey]);
   const current = row ? Number(row.image_count) : 0;
   const max = Number.isFinite(ocrMaxImagesPerDay) && ocrMaxImagesPerDay > 0 ? ocrMaxImagesPerDay : 100;
-
   if (current >= max) return { allowed: false, current, max, dateKey };
 
   await dbRun(
@@ -188,6 +210,9 @@ console.log(
 );
 console.log(`[startup] BUILD_FINGERPRINT=${BUILD_FINGERPRINT}`);
 console.log(`[startup] vision client init ${visionClientInitOk ? "success" : "fail"}`);
+console.log(
+  `[startup] AI_PROVIDER=${aiConfig.provider} AI_MODEL=${aiConfig.model} API_KEY_PRESENT=${aiConfig.apiKeyPresent}`
+);
 
 function verifyLineSignature(rawBody, signature, secret) {
   if (!signature || !secret) return false;
@@ -225,17 +250,21 @@ function logAiSkipped(reason) {
   console.log(`[ai] skipped reason=${reason}`);
 }
 
-function generateAssistantReply({ userText, imageOcrText, retryNoEcho = false }) {
-  const input = (userText || "").trim();
-  const askSendable = /幫我整理成一版可傳送回覆|整理成可傳送|直接給我可傳送|幫我寫回覆/.test(input);
-
-  if (askSendable) {
-    const core = input
-      .replace(/幫我整理成一版可傳送回覆|整理成可傳送|直接給我可傳送|幫我寫回覆/g, "")
-      .trim();
-    return core ? `建議回覆：\n${core}` : "建議回覆：\n收到，我會在今天內完成並回報進度。";
+function buildPrompt({ userText, imageOcrText }) {
+  const parts = [
+    "你是 LINE 助手，請直接回答問題，避免空泛寒暄與重複。",
+    "若使用者要求可直接傳送的內容，請直接給成品。",
+  ];
+  if (imageOcrText) {
+    parts.push(`圖片 OCR 內容：${imageOcrText}`);
   }
+  if (userText) {
+    parts.push(`使用者訊息：${userText}`);
+  }
+  return parts.join("\n");
+}
 
+function localFallbackReply({ userText, imageOcrText, retryNoEcho = false }) {
   if (imageOcrText && imageOcrText.trim()) {
     const summary = imageOcrText.slice(0, 220).replace(/\s+/g, " ").trim();
     return retryNoEcho
@@ -243,28 +272,107 @@ function generateAssistantReply({ userText, imageOcrText, retryNoEcho = false })
       : `圖片重點：${summary}`;
   }
 
+  const input = (userText || "").trim();
   if (input) {
     return retryNoEcho ? `我剛剛重複了，這次直接給你結論：${input}` : input;
   }
-
   return retryNoEcho
     ? "我剛剛重複了，這次直接給你結論：請告訴我你要我完成的任務。"
     : "請告訴我你要我完成的任務。";
 }
 
+async function callOpenAi({ prompt, model, apiKey }) {
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: "system", content: "請直接給出可執行、可傳送的答案，避免重述問題。" },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.4,
+    }),
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`openai http ${resp.status}: ${body.slice(0, 300)}`);
+  }
+  const data = await resp.json();
+  const text = data && data.choices && data.choices[0] && data.choices[0].message
+    ? data.choices[0].message.content
+    : "";
+  return String(text || "").trim();
+}
+
+async function callGemini({ prompt, model, apiKey }) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.4 },
+    }),
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`gemini http ${resp.status}: ${body.slice(0, 300)}`);
+  }
+  const data = await resp.json();
+  const parts =
+    data &&
+    data.candidates &&
+    data.candidates[0] &&
+    data.candidates[0].content &&
+    Array.isArray(data.candidates[0].content.parts)
+      ? data.candidates[0].content.parts
+      : [];
+  const text = parts
+    .map((p) => (p && p.text ? p.text : ""))
+    .join("")
+    .trim();
+  return text;
+}
+
 async function runAiGeneration({ userText, imageOcrText, retryNoEcho = false }) {
   const started = Date.now();
-  console.log(`[ai] request start model=${MODEL_NAME || "unknown"}`);
+  const prompt = buildPrompt({ userText, imageOcrText });
+  console.log(`[ai] request start model=${aiConfig.model}`);
+
+  if (!aiConfig.apiKeyPresent) {
+    logAiSkipped("missing_api_key");
+    return { source: "fallback", text: localFallbackReply({ userText, imageOcrText, retryNoEcho }) };
+  }
+
   try {
-    const finalText = generateAssistantReply({ userText, imageOcrText, retryNoEcho });
+    let finalText = "";
+    if (aiConfig.provider === "gemini") {
+      finalText = await callGemini({ prompt, model: aiConfig.model, apiKey: aiConfig.apiKey });
+    } else {
+      finalText = await callOpenAi({ prompt, model: aiConfig.model, apiKey: aiConfig.apiKey });
+    }
+
+    if (!finalText) {
+      logAiSkipped("empty_model_output");
+      return { source: "fallback", text: localFallbackReply({ userText, imageOcrText, retryNoEcho }) };
+    }
+
     const latencyMs = Date.now() - started;
-    console.log(`[ai] request ok latencyMs=${latencyMs} outputLen=${(finalText || "").length}`);
-    return finalText;
+    console.log(`[ai] request ok latencyMs=${latencyMs} outputLen=${finalText.length}`);
+    return { source: "llm", text: finalText };
   } catch (err) {
     console.log(
       `[ai] request error name=${err && err.name ? err.name : ""} code=${err && err.code ? err.code : ""} message=${(err && err.message ? err.message : "").slice(0, 200)}`
     );
-    throw err;
+    return { source: "fallback", text: localFallbackReply({ userText, imageOcrText, retryNoEcho }) };
   }
 }
 
@@ -386,13 +494,11 @@ async function downloadLineImage(messageId) {
       Authorization: `Bearer ${lineChannelAccessToken}`,
     },
   });
-
   if (!resp.ok) {
     const body = await resp.text();
     console.error(`[ocr] LINE content download fail status=${resp.status}`);
     throw new Error(`LINE content API failed status=${resp.status} body=${body}`);
   }
-
   console.log(`[ocr] LINE content download success status=${resp.status}`);
   const arrayBuffer = await resp.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
@@ -447,18 +553,19 @@ async function handleTextMessage(event, replySender) {
   }
 
   const userId = event && event.source && event.source.userId ? String(event.source.userId) : "";
-  let assistantText = await runAiGeneration({ userText: text });
+  let aiResult = await runAiGeneration({ userText: text });
   const previous = userId ? lastBotReplyByUser.get(userId) || "" : "";
-  let echoDetected = similarityScore(assistantText, previous) > 0.9;
+  let echoDetected = similarityScore(aiResult.text, previous) > 0.9;
   console.log(`[guard] echoDetected=${echoDetected}`);
   if (echoDetected) {
-    assistantText = await runAiGeneration({ userText: text, retryNoEcho: true });
-    echoDetected = similarityScore(assistantText, previous) > 0.9;
+    aiResult = await runAiGeneration({ userText: text, retryNoEcho: true });
+    echoDetected = similarityScore(aiResult.text, previous) > 0.9;
     console.log(`[guard] echoDetected=${echoDetected}`);
   }
-  await replySender.sendFinalReply(assistantText);
-  if (userId) lastBotReplyByUser.set(userId, assistantText);
-  return "text:assistant";
+
+  await replySender.sendFinalReply(aiResult.text);
+  if (userId) lastBotReplyByUser.set(userId, aiResult.text);
+  return aiResult.source === "llm" ? "text:assistant" : "text:fallback";
 }
 
 async function handleImageMessage(event, replySender) {
@@ -492,18 +599,19 @@ async function handleImageMessage(event, replySender) {
 
   if (ocrText) {
     const userId = event && event.source && event.source.userId ? String(event.source.userId) : "";
-    let assistantText = await runAiGeneration({ imageOcrText: ocrText });
+    let aiResult = await runAiGeneration({ imageOcrText: ocrText });
     const previous = userId ? lastBotReplyByUser.get(userId) || "" : "";
-    let echoDetected = similarityScore(assistantText, previous) > 0.9;
+    let echoDetected = similarityScore(aiResult.text, previous) > 0.9;
     console.log(`[guard] echoDetected=${echoDetected}`);
     if (echoDetected) {
-      assistantText = await runAiGeneration({ imageOcrText: ocrText, retryNoEcho: true });
-      echoDetected = similarityScore(assistantText, previous) > 0.9;
+      aiResult = await runAiGeneration({ imageOcrText: ocrText, retryNoEcho: true });
+      echoDetected = similarityScore(aiResult.text, previous) > 0.9;
       console.log(`[guard] echoDetected=${echoDetected}`);
     }
-    await replySender.sendFinalReply(assistantText);
-    if (userId) lastBotReplyByUser.set(userId, assistantText);
-    return "image:assistant";
+
+    await replySender.sendFinalReply(aiResult.text);
+    if (userId) lastBotReplyByUser.set(userId, aiResult.text);
+    return aiResult.source === "llm" ? "image:assistant" : "image:fallback";
   }
 
   logAiSkipped("image-fallback-no-ocr");
