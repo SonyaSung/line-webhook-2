@@ -30,6 +30,11 @@ const resolveKeywords = (process.env.RESOLVE_KEYWORDS || "#定稿,#okok")
   .map((x) => x.trim())
   .filter(Boolean);
 const dbPath = process.env.DB_PATH || "/data/line_assistant.sqlite";
+const openclawBaseUri = process.env.OPENCLAW_BASE_URI || "http://152.42.202.153:3000";
+const openclawPassword = process.env.OPENCLAW_PASSWORD || "";
+const openclawSessionKey = process.env.OPENCLAW_SESSION_KEY || "line-default";
+const transcriptLogPath = process.env.TRANSCRIPT_LOG_PATH || "/data/line-transcript.log";
+const transcriptEnabled = parseBoolean(process.env.TRANSCRIPT_ENABLED || "true");
 const ocrEnabledRaw = process.env.OCR_ENABLED || "";
 const ocrMaxImagesPerDay = Number.parseInt(process.env.OCR_MAX_IMAGES_PER_DAY || "100", 10);
 const allowedUserIdsRaw = process.env.ALLOWED_USER_IDS || "";
@@ -66,6 +71,17 @@ function parseAllowedUserIds(raw) {
     parsedValues = input.split(",");
   }
   return Array.from(new Set(parsedValues.map((x) => normalizeUserIdToken(x)).filter(Boolean)));
+}
+
+function normalizeHashTagText(value) {
+  return String(value || "").replace(/＃/g, "#");
+}
+
+function detectForwardTag(value) {
+  const text = normalizeHashTagText(value);
+  if (/#\s*okok/i.test(text)) return "#okok";
+  if (/#\s*紀錄/u.test(text)) return "#紀錄";
+  return null;
 }
 
 function maskUserId(value) {
@@ -212,6 +228,9 @@ console.log(`[startup] BUILD_FINGERPRINT=${BUILD_FINGERPRINT}`);
 console.log(`[startup] vision client init ${visionClientInitOk ? "success" : "fail"}`);
 console.log(
   `[startup] AI_PROVIDER=${aiConfig.provider} AI_MODEL=${aiConfig.model} API_KEY_PRESENT=${aiConfig.apiKeyPresent}`
+);
+console.log(
+  `[startup] TRANSCRIPT_ENABLED=${transcriptEnabled} TRANSCRIPT_LOG_PATH=${transcriptLogPath} OPENCLAW_BASE_URI=${openclawBaseUri} OPENCLAW_SESSION_KEY=${openclawSessionKey}`
 );
 
 function verifyLineSignature(rawBody, signature, secret) {
@@ -376,6 +395,101 @@ async function runAiGeneration({ userText, imageOcrText, retryNoEcho = false }) 
   }
 }
 
+function buildOpenclawEndpoint(baseUri, sessionKey) {
+  const safeBase = String(baseUri || "").trim().replace(/\/+$/, "");
+  const safeSessionKey = encodeURIComponent(String(sessionKey || "").trim() || "line-default");
+  return `${safeBase}/api/sessions/${safeSessionKey}/messages`;
+}
+
+function truncateText(value, max) {
+  return String(value || "").slice(0, max);
+}
+
+async function appendTranscriptLog(entry) {
+  const dir = path.dirname(transcriptLogPath);
+  await fs.promises.mkdir(dir, { recursive: true });
+  await fs.promises.appendFile(transcriptLogPath, `${JSON.stringify(entry)}\n`, "utf8");
+  console.log(`[forward] log appended path=${transcriptLogPath}`);
+}
+
+async function forwardTaggedTranscript(event, text, sourceTag) {
+  if (!transcriptEnabled) {
+    console.log(`[forward] triggered=true tag=${sourceTag} enabled=false`);
+    return;
+  }
+
+  const userId = event && event.source && event.source.userId ? String(event.source.userId) : "";
+  const userIdMasked = maskUserId(userId);
+  const ts = new Date().toISOString();
+  const payload = {
+    userId: userIdMasked,
+    timestamp: event && event.timestamp ? event.timestamp : Date.now(),
+    text,
+    channel: "line",
+    sourceTag,
+  };
+
+  let openclawForwarded = false;
+  let openclawStatus = "error";
+  let errorText = "";
+  const started = Date.now();
+
+  try {
+    if (!openclawBaseUri) throw new Error("OPENCLAW_BASE_URI missing");
+    if (!openclawPassword) throw new Error("OPENCLAW_PASSWORD missing");
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    const endpoint = buildOpenclawEndpoint(openclawBaseUri, openclawSessionKey);
+    let resp;
+    try {
+      resp = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${openclawPassword}`,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`http ${resp.status} ${truncateText(body, 200)}`);
+    }
+
+    openclawForwarded = true;
+    openclawStatus = "ok";
+    console.log(`[forward] openclaw status=ok latencyMs=${Date.now() - started}`);
+  } catch (err) {
+    openclawForwarded = false;
+    openclawStatus = "error";
+    errorText = truncateText(err && err.message ? err.message : String(err), 200);
+    console.log(`[forward] openclaw status=error latencyMs=${Date.now() - started}`);
+    console.error(`[forward] openclaw error=${errorText}`);
+  }
+
+  const logEntry = {
+    ts,
+    channel: "line",
+    userIdMasked,
+    tag: sourceTag,
+    text,
+    openclawForwarded,
+    openclawStatus,
+  };
+  if (errorText) logEntry.error = errorText;
+
+  try {
+    await appendTranscriptLog(logEntry);
+  } catch (err) {
+    console.error(`[forward] append log error=${truncateText(formatError(err), 200)}`);
+  }
+}
+
 function levenshteinDistance(a, b) {
   const s = a || "";
   const t = b || "";
@@ -529,6 +643,12 @@ async function handleTextMessage(event, replySender) {
     logAiSkipped("text-empty");
     await replySender.sendFinalReply("我已收到你的訊息，請再補充你希望我怎麼協助。");
     return "text:empty";
+  }
+
+  const matchedForwardTag = detectForwardTag(text);
+  if (matchedForwardTag) {
+    console.log(`[forward] triggered=true tag=${matchedForwardTag}`);
+    await forwardTaggedTranscript(event, text, matchedForwardTag);
   }
 
   const pendingContent = parsePendingContent(text);
