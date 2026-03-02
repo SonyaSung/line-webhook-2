@@ -22,12 +22,7 @@ const resolveKeywords = (process.env.RESOLVE_KEYWORDS || "#定稿,#okok")
 const dbPath = process.env.DB_PATH || "/data/line_assistant.sqlite";
 const ocrEnabledRaw = process.env.OCR_ENABLED || "";
 const ocrMaxImagesPerDay = Number.parseInt(process.env.OCR_MAX_IMAGES_PER_DAY || "100", 10);
-const allowedUserIds = new Set(
-  (process.env.ALLOWED_USER_IDS || "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean)
-);
+const allowedUserIdsRaw = process.env.ALLOWED_USER_IDS || "";
 const googleCredentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON || "";
 
 function parseBoolean(value) {
@@ -35,7 +30,48 @@ function parseBoolean(value) {
   return normalized === "true" || normalized === "1" || normalized === "yes";
 }
 
+function normalizeUserIdToken(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^['"]+|['"]+$/g, "")
+    .trim();
+}
+
+function parseAllowedUserIds(raw) {
+  if (!raw || !String(raw).trim()) return [];
+
+  const input = String(raw).trim();
+  let parsedValues = [];
+
+  if (input.startsWith("[") && input.endsWith("]")) {
+    try {
+      const fromJson = JSON.parse(input);
+      if (Array.isArray(fromJson)) {
+        parsedValues = fromJson;
+      } else {
+        parsedValues = [input];
+      }
+    } catch (err) {
+      parsedValues = input.split(",");
+    }
+  } else {
+    parsedValues = input.split(",");
+  }
+
+  return Array.from(
+    new Set(parsedValues.map((x) => normalizeUserIdToken(x)).filter(Boolean))
+  );
+}
+
+function maskUserId(value) {
+  if (!value) return "(none)";
+  const normalized = String(value).trim();
+  return `${normalized.slice(0, 8)}...`;
+}
+
 const ocrEnabled = parseBoolean(ocrEnabledRaw);
+const allowedUserIds = parseAllowedUserIds(allowedUserIdsRaw);
+const allowedUserIdSet = new Set(allowedUserIds);
 
 function formatError(err) {
   if (!err) return "unknown error";
@@ -154,7 +190,7 @@ function initVisionClient() {
 initVisionClient();
 
 console.log(
-  `[startup] APP_VERSION=${appVersion} OCR_ENABLED_RAW=${ocrEnabledRaw || "(empty)"} OCR_ENABLED=${ocrEnabled} OCR_MAX_IMAGES_PER_DAY=${ocrMaxImagesPerDay} ALLOWED_USER_IDS_COUNT=${allowedUserIds.size} SUGGESTION_COUNT=${suggestionCount} DB_PATH=${dbPath}`
+  `[startup] APP_VERSION=${appVersion} OCR_ENABLED_RAW=${ocrEnabledRaw || "(empty)"} OCR_ENABLED=${ocrEnabled} OCR_MAX_IMAGES_PER_DAY=${ocrMaxImagesPerDay} ALLOWED_USER_IDS_COUNT=${allowedUserIds.length} SUGGESTION_COUNT=${suggestionCount} DB_PATH=${dbPath}`
 );
 console.log(`[startup] vision client init ${visionClientInitOk ? "success" : "fail"}`);
 
@@ -249,7 +285,7 @@ async function runOcr(imageBuffer) {
 
 function isAllowedOcrUser(event) {
   const userId = event && event.source && event.source.userId;
-  return Boolean(userId && allowedUserIds.has(userId));
+  return Boolean(userId && allowedUserIdSet.has(userId));
 }
 
 function parsePendingContent(text) {
@@ -339,8 +375,14 @@ async function handleLineEvent(event) {
   if (!replyToken) return;
 
   const hasUserId = Boolean(event && event.source && event.source.userId);
+  const incomingUserId = hasUserId ? event.source.userId : "";
   const messageType = event && event.message && event.message.type ? event.message.type : "(none)";
   const allowed = isAllowedOcrUser(event);
+  const allowedMaskedList = allowedUserIds.map((id) => maskUserId(id));
+  const incomingUserIdMasked = maskUserId(incomingUserId);
+  console.log(
+    `[AUTH] incoming=${incomingUserIdMasked} allowed=[${allowedMaskedList.join(",")}] hasUserId=${hasUserId} isAllowedUser=${allowed}`
+  );
   console.log(
     `[event] event.type=${event.type || "(none)"} message.type=${messageType} hasUserId=${hasUserId} isAllowedUser=${allowed}`
   );
