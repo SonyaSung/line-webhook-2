@@ -15,6 +15,7 @@ const lineChannelSecret = process.env.LINE_CHANNEL_SECRET || "";
 const timezone = process.env.TZ || "UTC";
 const appVersion = process.env.APP_VERSION || process.env.npm_package_version || "dev";
 const BUILD_FINGERPRINT = process.env.BUILD_FINGERPRINT || "dev-local";
+const MODEL_NAME = process.env.MODEL_NAME || process.env.OPENCLAW_MODEL || "unknown";
 const suggestionCount = Number.parseInt(process.env.SUGGESTION_COUNT || "2", 10);
 const resolveKeywords = (process.env.RESOLVE_KEYWORDS || "#定稿,#okok")
   .split(",")
@@ -25,6 +26,10 @@ const ocrEnabledRaw = process.env.OCR_ENABLED || "";
 const ocrMaxImagesPerDay = Number.parseInt(process.env.OCR_MAX_IMAGES_PER_DAY || "100", 10);
 const allowedUserIdsRaw = process.env.ALLOWED_USER_IDS || "";
 const googleCredentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON || "";
+
+const messageDedupeTtlMs = 5 * 60 * 1000;
+const recentMessageCache = new Map();
+const lastBotReplyByUser = new Map();
 
 function parseBoolean(value) {
   const normalized = String(value || "").trim().toLowerCase();
@@ -46,8 +51,8 @@ function parseAllowedUserIds(raw) {
 
   if (input.startsWith("[") && input.endsWith("]")) {
     try {
-      const fromJson = JSON.parse(input);
-      parsedValues = Array.isArray(fromJson) ? fromJson : [input];
+      const parsed = JSON.parse(input);
+      parsedValues = Array.isArray(parsed) ? parsed : [input];
     } catch (err) {
       parsedValues = input.split(",");
     }
@@ -60,8 +65,7 @@ function parseAllowedUserIds(raw) {
 
 function maskUserId(value) {
   if (!value) return "(none)";
-  const normalized = String(value).trim();
-  return `${normalized.slice(0, 8)}...`;
+  return `${String(value).trim().slice(0, 8)}...`;
 }
 
 function formatError(err) {
@@ -74,9 +78,6 @@ function formatError(err) {
 const ocrEnabled = parseBoolean(ocrEnabledRaw);
 const allowedUserIds = parseAllowedUserIds(allowedUserIdsRaw);
 const allowedUserIdSet = new Set(allowedUserIds);
-const messageDedupeTtlMs = 5 * 60 * 1000;
-const recentMessageCache = new Map();
-const lastBotReplyByUser = new Map();
 
 function openDb() {
   const dbDir = path.dirname(dbPath);
@@ -197,16 +198,16 @@ function verifyLineSignature(rawBody, signature, secret) {
   return crypto.timingSafeEqual(sigA, sigB);
 }
 
+function parsePendingContent(text) {
+  const match = text.match(/^[#＃]待回(?:\s+|[:：]\s*)?(.*)$/u);
+  return match ? match[1].trim() : null;
+}
+
 function insertResolvedCase(keyword, content, originalText, userId) {
   return dbRun(
     "INSERT INTO resolved_cases(keyword, content, original_text, user_id) VALUES(?, ?, ?, ?)",
     [keyword, content, originalText, userId || null]
   );
-}
-
-function parsePendingContent(text) {
-  const match = text.match(/^[#＃]待回(?:\s+|[:：]\s*)?(.*)$/u);
-  return match ? match[1].trim() : null;
 }
 
 function buildWaitReplySuggestions(content, count) {
@@ -218,6 +219,10 @@ function buildWaitReplySuggestions(content, count) {
     "好的，我已經記下來，會直接幫你跟進。",
   ];
   return defaults.slice(0, safeCount);
+}
+
+function logAiSkipped(reason) {
+  console.log(`[ai] skipped reason=${reason}`);
 }
 
 function generateAssistantReply({ userText, imageOcrText, retryNoEcho = false }) {
@@ -239,12 +244,28 @@ function generateAssistantReply({ userText, imageOcrText, retryNoEcho = false })
   }
 
   if (input) {
-    return retryNoEcho ? `我剛剛重複了，這次直接給你結論：${input}` : `${input}`;
+    return retryNoEcho ? `我剛剛重複了，這次直接給你結論：${input}` : input;
   }
 
   return retryNoEcho
     ? "我剛剛重複了，這次直接給你結論：請告訴我你要我完成的任務。"
     : "請告訴我你要我完成的任務。";
+}
+
+async function runAiGeneration({ userText, imageOcrText, retryNoEcho = false }) {
+  const started = Date.now();
+  console.log(`[ai] request start model=${MODEL_NAME || "unknown"}`);
+  try {
+    const finalText = generateAssistantReply({ userText, imageOcrText, retryNoEcho });
+    const latencyMs = Date.now() - started;
+    console.log(`[ai] request ok latencyMs=${latencyMs} outputLen=${(finalText || "").length}`);
+    return finalText;
+  } catch (err) {
+    console.log(
+      `[ai] request error name=${err && err.name ? err.name : ""} code=${err && err.code ? err.code : ""} message=${(err && err.message ? err.message : "").slice(0, 200)}`
+    );
+    throw err;
+  }
 }
 
 function levenshteinDistance(a, b) {
@@ -357,9 +378,7 @@ function createFinalReplySender(replyToken) {
 }
 
 async function downloadLineImage(messageId) {
-  if (!lineChannelAccessToken) {
-    throw new Error("LINE_CHANNEL_ACCESS_TOKEN missing");
-  }
+  if (!lineChannelAccessToken) throw new Error("LINE_CHANNEL_ACCESS_TOKEN missing");
   console.log(`[ocr] LINE content download start messageId=${messageId}`);
   const resp = await fetch(`${LINE_CONTENT_API_BASE}/${messageId}/content`, {
     method: "GET",
@@ -401,18 +420,21 @@ function isAllowedOcrUser(event) {
 async function handleTextMessage(event, replySender) {
   const text = (event.message && event.message.text ? event.message.text : "").trim();
   if (!text) {
+    logAiSkipped("text-empty");
     await replySender.sendFinalReply("我已收到你的訊息，請再補充你希望我怎麼協助。");
     return "text:empty";
   }
 
   const pendingContent = parsePendingContent(text);
   if (pendingContent !== null) {
+    logAiSkipped("text-pending-template");
     await replySender.sendFinalReply(buildWaitReplySuggestions(pendingContent, suggestionCount));
     return "text:#待回";
   }
 
   const matchedResolveKeyword = resolveKeywords.find((kw) => text.startsWith(kw));
   if (matchedResolveKeyword) {
+    logAiSkipped("text-resolve-keyword");
     const content = text.slice(matchedResolveKeyword.length).trim();
     try {
       await insertResolvedCase(matchedResolveKeyword, content, text, event.source && event.source.userId);
@@ -425,14 +447,13 @@ async function handleTextMessage(event, replySender) {
   }
 
   const userId = event && event.source && event.source.userId ? String(event.source.userId) : "";
-  let assistantText = generateAssistantReply({ userText: text });
+  let assistantText = await runAiGeneration({ userText: text });
   const previous = userId ? lastBotReplyByUser.get(userId) || "" : "";
   let echoDetected = similarityScore(assistantText, previous) > 0.9;
   console.log(`[guard] echoDetected=${echoDetected}`);
   if (echoDetected) {
-    assistantText = generateAssistantReply({ userText: text, retryNoEcho: true });
-    const secondScore = similarityScore(assistantText, previous);
-    echoDetected = secondScore > 0.9;
+    assistantText = await runAiGeneration({ userText: text, retryNoEcho: true });
+    echoDetected = similarityScore(assistantText, previous) > 0.9;
     console.log(`[guard] echoDetected=${echoDetected}`);
   }
   await replySender.sendFinalReply(assistantText);
@@ -445,14 +466,12 @@ async function handleImageMessage(event, replySender) {
   console.log(`[ocr] vision client init ${visionClientInitOk ? "success" : "fail"}`);
 
   let ocrText = "";
-
   if (ocrEnabled && isAllowedOcrUser(event)) {
     try {
       const quota = await tryConsumeOcrQuota();
       console.log(
         `[ocr] quota check result todayCount=${quota.current} max=${quota.max} allowed=${quota.allowed}`
       );
-
       if (quota.allowed) {
         const messageId = event.message && event.message.id;
         if (!messageId) throw new Error("Missing image message.id");
@@ -460,24 +479,26 @@ async function handleImageMessage(event, replySender) {
         ocrText = await runOcr(imageBuffer);
       } else {
         console.log("[ocr] quota exceeded");
+        logAiSkipped("image-ocr-quota-exceeded");
       }
     } catch (err) {
       console.error("[ocr] image flow failed:", formatError(err));
+      logAiSkipped("image-ocr-error");
     }
   } else {
     console.log("[ocr] skipped (disabled or not allowed user)");
+    logAiSkipped("image-ocr-disabled-or-not-allowed");
   }
 
   if (ocrText) {
     const userId = event && event.source && event.source.userId ? String(event.source.userId) : "";
-    let assistantText = generateAssistantReply({ imageOcrText: ocrText });
+    let assistantText = await runAiGeneration({ imageOcrText: ocrText });
     const previous = userId ? lastBotReplyByUser.get(userId) || "" : "";
     let echoDetected = similarityScore(assistantText, previous) > 0.9;
     console.log(`[guard] echoDetected=${echoDetected}`);
     if (echoDetected) {
-      assistantText = generateAssistantReply({ imageOcrText: ocrText, retryNoEcho: true });
-      const secondScore = similarityScore(assistantText, previous);
-      echoDetected = secondScore > 0.9;
+      assistantText = await runAiGeneration({ imageOcrText: ocrText, retryNoEcho: true });
+      echoDetected = similarityScore(assistantText, previous) > 0.9;
       console.log(`[guard] echoDetected=${echoDetected}`);
     }
     await replySender.sendFinalReply(assistantText);
@@ -485,6 +506,7 @@ async function handleImageMessage(event, replySender) {
     return "image:assistant";
   }
 
+  logAiSkipped("image-fallback-no-ocr");
   await replySender.sendFinalReply("我看到了圖片，但目前無法完整辨識，請補充你想問的重點。");
   return "image:fallback";
 }
@@ -496,17 +518,15 @@ async function handleLineEvent(event) {
     console.log(`[flow] eventId=${eventId} type=${event.type || "unknown"} branch=no-reply-token replied=false`);
     return;
   }
-  if (shouldSkipDuplicate(event)) {
-    return;
-  }
+  if (shouldSkipDuplicate(event)) return;
 
   const hasUserId = Boolean(event && event.source && event.source.userId);
   const incomingUserId = hasUserId ? event.source.userId : "";
   const allowed = isAllowedOcrUser(event);
-  const allowedMaskedList = allowedUserIds.map((id) => maskUserId(id));
-  const incomingUserIdMasked = maskUserId(incomingUserId);
   console.log(
-    `[AUTH] incoming=${incomingUserIdMasked} allowed=[${allowedMaskedList.join(",")}] hasUserId=${hasUserId} isAllowedUser=${allowed}`
+    `[AUTH] incoming=${maskUserId(incomingUserId)} allowed=[${allowedUserIds
+      .map((id) => maskUserId(id))
+      .join(",")}] hasUserId=${hasUserId} isAllowedUser=${allowed}`
   );
 
   const messageType = event && event.message && event.message.type ? event.message.type : "";
@@ -515,6 +535,7 @@ async function handleLineEvent(event) {
 
   try {
     if (!(event.type === "message" && event.message)) {
+      logAiSkipped("non-message");
       await replySender.sendFinalReply("已收到。");
       branch = "non-message:fallback";
     } else if (messageType === "text") {
@@ -522,6 +543,7 @@ async function handleLineEvent(event) {
     } else if (messageType === "image") {
       branch = await handleImageMessage(event, replySender);
     } else {
+      logAiSkipped(`unsupported-message-type:${messageType || "unknown"}`);
       await replySender.sendFinalReply("已收到。");
       branch = `message:${messageType || "unknown"}:fallback`;
     }
