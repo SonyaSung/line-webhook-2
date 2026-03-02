@@ -33,6 +33,8 @@ const dbPath = process.env.DB_PATH || "/data/line_assistant.sqlite";
 const openclawBaseUri = process.env.OPENCLAW_BASE_URI || "http://152.42.202.153:3000";
 const openclawPassword = process.env.OPENCLAW_PASSWORD || "";
 const openclawSessionKey = process.env.OPENCLAW_SESSION_KEY || "line-default";
+const openclawModel = process.env.OPENCLAW_MODEL || "openclaw:main";
+const openclawForwardUrl = process.env.OPENCLAW_FORWARD_URL || "";
 const transcriptLogPath = process.env.TRANSCRIPT_LOG_PATH || "/data/line-transcript.log";
 const transcriptEnabled = parseBoolean(process.env.TRANSCRIPT_ENABLED || "true");
 const ocrEnabledRaw = process.env.OCR_ENABLED || "";
@@ -232,6 +234,9 @@ console.log(
 console.log(
   `[startup] TRANSCRIPT_ENABLED=${transcriptEnabled} TRANSCRIPT_LOG_PATH=${transcriptLogPath} OPENCLAW_BASE_URI=${openclawBaseUri} OPENCLAW_SESSION_KEY=${openclawSessionKey}`
 );
+console.log(
+  `[startup] OPENCLAW_FORWARD_URL=${openclawForwardUrl || "(auto:/v1/responses)"} OPENCLAW_MODEL=${openclawModel}`
+);
 
 function verifyLineSignature(rawBody, signature, secret) {
   if (!signature || !secret) return false;
@@ -395,10 +400,41 @@ async function runAiGeneration({ userText, imageOcrText, retryNoEcho = false }) 
   }
 }
 
-function buildOpenclawEndpoint(baseUri, sessionKey) {
+function buildOpenclawCandidateUrls(baseUri, sessionKey) {
   const safeBase = String(baseUri || "").trim().replace(/\/+$/, "");
   const safeSessionKey = encodeURIComponent(String(sessionKey || "").trim() || "line-default");
-  return `${safeBase}/api/sessions/${safeSessionKey}/messages`;
+  if (!safeBase) return [];
+
+  if (openclawForwardUrl && String(openclawForwardUrl).trim()) {
+    return [String(openclawForwardUrl).trim()];
+  }
+
+  return [
+    `${safeBase}/v1/responses`,
+    `${safeBase}/api/sessions/${safeSessionKey}/messages`,
+  ];
+}
+
+function buildOpenclawRequestBody(targetUrl, payload) {
+  if (targetUrl.endsWith("/v1/responses")) {
+    return {
+      model: openclawModel,
+      input: `請整理以下 LINE 訊息並提取重點與可執行待辦：\n${payload.text}`,
+      user: payload.userId,
+      metadata: {
+        channel: payload.channel,
+        sourceTag: payload.sourceTag,
+      },
+    };
+  }
+
+  return {
+    userId: payload.userId,
+    timestamp: payload.timestamp,
+    text: payload.text,
+    channel: payload.channel,
+    sourceTag: payload.sourceTag,
+  };
 }
 
 function truncateText(value, max) {
@@ -438,32 +474,46 @@ async function forwardTaggedTranscript(event, text, sourceTag) {
     if (!openclawBaseUri) throw new Error("OPENCLAW_BASE_URI missing");
     if (!openclawPassword) throw new Error("OPENCLAW_PASSWORD missing");
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
-    const endpoint = buildOpenclawEndpoint(openclawBaseUri, openclawSessionKey);
-    let resp;
-    try {
-      resp = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${openclawPassword}`,
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timeoutId);
+    const candidateUrls = buildOpenclawCandidateUrls(openclawBaseUri, openclawSessionKey);
+    if (candidateUrls.length === 0) throw new Error("OPENCLAW_BASE_URI missing");
+
+    let lastError = "";
+    for (const endpoint of candidateUrls) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      try {
+        const reqBody = buildOpenclawRequestBody(endpoint, payload);
+        const resp = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${openclawPassword}`,
+            "x-openclaw-session-key": String(openclawSessionKey || "line-default"),
+          },
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
+
+        if (resp.ok) {
+          openclawForwarded = true;
+          openclawStatus = "ok";
+          console.log(`[forward] openclaw status=ok latencyMs=${Date.now() - started} endpoint=${endpoint}`);
+          lastError = "";
+          break;
+        }
+
+        const body = await resp.text();
+        lastError = `http ${resp.status} ${truncateText(body, 200)}`;
+      } catch (err) {
+        lastError = truncateText(err && err.message ? err.message : String(err), 200);
+      } finally {
+        clearTimeout(timeoutId);
+      }
     }
 
-    if (!resp.ok) {
-      const body = await resp.text();
-      throw new Error(`http ${resp.status} ${truncateText(body, 200)}`);
+    if (!openclawForwarded) {
+      throw new Error(lastError || "forward failed");
     }
-
-    openclawForwarded = true;
-    openclawStatus = "ok";
-    console.log(`[forward] openclaw status=ok latencyMs=${Date.now() - started}`);
   } catch (err) {
     openclawForwarded = false;
     openclawStatus = "error";
