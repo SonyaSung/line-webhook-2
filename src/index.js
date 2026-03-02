@@ -74,6 +74,9 @@ function formatError(err) {
 const ocrEnabled = parseBoolean(ocrEnabledRaw);
 const allowedUserIds = parseAllowedUserIds(allowedUserIdsRaw);
 const allowedUserIdSet = new Set(allowedUserIds);
+const messageDedupeTtlMs = 5 * 60 * 1000;
+const recentMessageCache = new Map();
+const lastBotReplyByUser = new Map();
 
 function openDb() {
   const dbDir = path.dirname(dbPath);
@@ -217,14 +220,86 @@ function buildWaitReplySuggestions(content, count) {
   return defaults.slice(0, safeCount);
 }
 
-function generateAssistantReply({ userText, imageOcrText }) {
+function generateAssistantReply({ userText, imageOcrText, retryNoEcho = false }) {
+  const input = (userText || "").trim();
+  const askSendable = /幫我整理成一版可傳送回覆|整理成可傳送|直接給我可傳送|幫我寫回覆/.test(input);
+
+  if (askSendable) {
+    const core = input
+      .replace(/幫我整理成一版可傳送回覆|整理成可傳送|直接給我可傳送|幫我寫回覆/g, "")
+      .trim();
+    return core ? `建議回覆：\n${core}` : "建議回覆：\n收到，我會在今天內完成並回報進度。";
+  }
+
   if (imageOcrText && imageOcrText.trim()) {
-    return `我已看過圖片內容，重點如下：\n${imageOcrText.slice(0, 300)}\n\n如果你要，我可以再幫你整理成可直接傳給對方的一段訊息。`;
+    const summary = imageOcrText.slice(0, 220).replace(/\s+/g, " ").trim();
+    return retryNoEcho
+      ? `我剛剛重複了，這次直接給你結論：圖片重點是「${summary}」。`
+      : `圖片重點：${summary}`;
   }
-  if (userText && userText.trim()) {
-    return `收到，我理解你的重點是：${userText.trim()}\n\n如果你願意，我可以直接幫你整理成一版可傳送的回覆。`;
+
+  if (input) {
+    return retryNoEcho ? `我剛剛重複了，這次直接給你結論：${input}` : `${input}`;
   }
-  return "我已收到你的訊息，請再補充你希望我怎麼協助。";
+
+  return retryNoEcho
+    ? "我剛剛重複了，這次直接給你結論：請告訴我你要我完成的任務。"
+    : "請告訴我你要我完成的任務。";
+}
+
+function levenshteinDistance(a, b) {
+  const s = a || "";
+  const t = b || "";
+  const m = s.length;
+  const n = t.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i += 1) dp[i][0] = i;
+  for (let j = 0; j <= n; j += 1) dp[0][j] = j;
+  for (let i = 1; i <= m; i += 1) {
+    for (let j = 1; j <= n; j += 1) {
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[m][n];
+}
+
+function similarityScore(a, b) {
+  const left = (a || "").trim();
+  const right = (b || "").trim();
+  if (!left && !right) return 1;
+  if (!left || !right) return 0;
+  if (left === right) return 1;
+  const maxLen = Math.max(left.length, right.length);
+  if (maxLen === 0) return 1;
+  const dist = levenshteinDistance(left, right);
+  return 1 - dist / maxLen;
+}
+
+function cleanupDedupeCache(nowMs) {
+  for (const [key, ts] of recentMessageCache.entries()) {
+    if (nowMs - ts > messageDedupeTtlMs) {
+      recentMessageCache.delete(key);
+    }
+  }
+}
+
+function shouldSkipDuplicate(event) {
+  const userId = event && event.source && event.source.userId ? String(event.source.userId) : "";
+  const messageId = event && event.message && event.message.id ? String(event.message.id) : "";
+  if (!userId || !messageId) return false;
+
+  const now = Date.now();
+  cleanupDedupeCache(now);
+  const key = `${userId}:${messageId}`;
+  if (recentMessageCache.has(key)) {
+    console.log(`[dedupe] skip duplicate messageId=${messageId}`);
+    return true;
+  }
+  recentMessageCache.set(key, now);
+  return false;
 }
 
 async function replyToLine(replyToken, messages) {
@@ -349,8 +424,19 @@ async function handleTextMessage(event, replySender) {
     return `text:resolve:${matchedResolveKeyword}`;
   }
 
-  const assistantText = generateAssistantReply({ userText: text });
+  const userId = event && event.source && event.source.userId ? String(event.source.userId) : "";
+  let assistantText = generateAssistantReply({ userText: text });
+  const previous = userId ? lastBotReplyByUser.get(userId) || "" : "";
+  let echoDetected = similarityScore(assistantText, previous) > 0.9;
+  console.log(`[guard] echoDetected=${echoDetected}`);
+  if (echoDetected) {
+    assistantText = generateAssistantReply({ userText: text, retryNoEcho: true });
+    const secondScore = similarityScore(assistantText, previous);
+    echoDetected = secondScore > 0.9;
+    console.log(`[guard] echoDetected=${echoDetected}`);
+  }
   await replySender.sendFinalReply(assistantText);
+  if (userId) lastBotReplyByUser.set(userId, assistantText);
   return "text:assistant";
 }
 
@@ -383,8 +469,19 @@ async function handleImageMessage(event, replySender) {
   }
 
   if (ocrText) {
-    const assistantText = generateAssistantReply({ imageOcrText: ocrText });
+    const userId = event && event.source && event.source.userId ? String(event.source.userId) : "";
+    let assistantText = generateAssistantReply({ imageOcrText: ocrText });
+    const previous = userId ? lastBotReplyByUser.get(userId) || "" : "";
+    let echoDetected = similarityScore(assistantText, previous) > 0.9;
+    console.log(`[guard] echoDetected=${echoDetected}`);
+    if (echoDetected) {
+      assistantText = generateAssistantReply({ imageOcrText: ocrText, retryNoEcho: true });
+      const secondScore = similarityScore(assistantText, previous);
+      echoDetected = secondScore > 0.9;
+      console.log(`[guard] echoDetected=${echoDetected}`);
+    }
     await replySender.sendFinalReply(assistantText);
+    if (userId) lastBotReplyByUser.set(userId, assistantText);
     return "image:assistant";
   }
 
@@ -397,6 +494,9 @@ async function handleLineEvent(event) {
   const eventId = event.webhookEventId || `${event.timestamp || Date.now()}-${(replyToken || "").slice(0, 8)}`;
   if (!replyToken) {
     console.log(`[flow] eventId=${eventId} type=${event.type || "unknown"} branch=no-reply-token replied=false`);
+    return;
+  }
+  if (shouldSkipDuplicate(event)) {
     return;
   }
 
