@@ -72,6 +72,7 @@ function maskUserId(value) {
 const ocrEnabled = parseBoolean(ocrEnabledRaw);
 const allowedUserIds = parseAllowedUserIds(allowedUserIdsRaw);
 const allowedUserIdSet = new Set(allowedUserIds);
+let fullUserIdLoggedOnce = false;
 
 function formatError(err) {
   if (!err) return "unknown error";
@@ -378,6 +379,10 @@ async function handleLineEvent(event) {
   const incomingUserId = hasUserId ? event.source.userId : "";
   const messageType = event && event.message && event.message.type ? event.message.type : "(none)";
   const allowed = isAllowedOcrUser(event);
+  if (hasUserId && !fullUserIdLoggedOnce) {
+    console.log(`[AUTH_FULL_ONCE] source.userId=${event.source.userId}`);
+    fullUserIdLoggedOnce = true;
+  }
   const allowedMaskedList = allowedUserIds.map((id) => maskUserId(id));
   const incomingUserIdMasked = maskUserId(incomingUserId);
   console.log(
