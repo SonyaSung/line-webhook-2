@@ -7,7 +7,7 @@
 npm install
 ```
 
-2. Set env vars:
+2. Set environment variables:
 ```bash
 set LINE_CHANNEL_ACCESS_TOKEN=YOUR_LINE_CHANNEL_ACCESS_TOKEN
 set LINE_CHANNEL_SECRET=YOUR_LINE_CHANNEL_SECRET
@@ -15,6 +15,10 @@ set TZ=Asia/Taipei
 set SUGGESTION_COUNT=2
 set RESOLVE_KEYWORDS=#定稿,#okok
 set DB_PATH=/data/line_assistant.sqlite
+set OCR_ENABLED=true
+set OCR_MAX_IMAGES_PER_DAY=100
+set ALLOWED_USER_IDS=Uxxxxxxxx1,Uxxxxxxxx2
+set GOOGLE_APPLICATION_CREDENTIALS_JSON={"type":"service_account",...}
 ```
 
 3. Start server:
@@ -28,10 +32,26 @@ curl http://localhost:3000/health
 ```
 Expected response: `ok`
 
-## Behavior
+## Google Vision OCR Setup
+
+1. Create a Google Cloud project and enable **Vision API**.
+2. Create a Service Account with Vision access.
+3. Generate a JSON key for that Service Account.
+4. Put the JSON content into `GOOGLE_APPLICATION_CREDENTIALS_JSON`.
+5. Set `OCR_ENABLED=true`.
+6. Set `ALLOWED_USER_IDS` to specific LINE user IDs to control OCR cost.
+7. Optional daily cap: `OCR_MAX_IMAGES_PER_DAY` (default `100`).
+
+## Behavior Summary
 
 - `POST /line/webhook` validates `x-line-signature`.
-- `#待回 ...` replies multiple separate messages (default 2).
-- `#定稿 ...` or `#okok ...` marks case as resolved in sqlite.
+- Text `#待回 ...`: replies with multiple separate suggestions.
+- Text `#定稿 ...` / `#okok ...`: marks case resolved and writes to sqlite.
+- Image message:
+  - Downloads image from LINE content API by `message.id`.
+  - Runs OCR via Google Vision.
+  - Uses OCR text as `#待回` content and replies suggestions.
+  - If OCR fails: replies `我讀不到圖片文字，請補一張更清楚的圖或直接貼文字`.
+- OCR only runs when sender is in `ALLOWED_USER_IDS`.
 - Non-text or non-keyword messages reply `已收到`.
-- Reply API failure logs error but webhook still returns `200 ok`.
+- Reply API errors are logged; webhook still returns `200 ok`.
