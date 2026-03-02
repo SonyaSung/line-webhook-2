@@ -14,6 +14,7 @@ const lineChannelAccessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
 const lineChannelSecret = process.env.LINE_CHANNEL_SECRET || "";
 const timezone = process.env.TZ || "UTC";
 const appVersion = process.env.APP_VERSION || process.env.npm_package_version || "dev";
+const BUILD_FINGERPRINT = process.env.BUILD_FINGERPRINT || "dev-local";
 const suggestionCount = Number.parseInt(process.env.SUGGESTION_COUNT || "2", 10);
 const resolveKeywords = (process.env.RESOLVE_KEYWORDS || "#定稿,#okok")
   .split(",")
@@ -181,6 +182,7 @@ initVisionClient();
 console.log(
   `[startup] APP_VERSION=${appVersion} OCR_ENABLED_RAW=${ocrEnabledRaw || "(empty)"} OCR_ENABLED=${ocrEnabled} OCR_MAX_IMAGES_PER_DAY=${ocrMaxImagesPerDay} ALLOWED_USER_IDS_COUNT=${allowedUserIds.length} SUGGESTION_COUNT=${suggestionCount} DB_PATH=${dbPath}`
 );
+console.log(`[startup] BUILD_FINGERPRINT=${BUILD_FINGERPRINT}`);
 console.log(`[startup] vision client init ${visionClientInitOk ? "success" : "fail"}`);
 
 function verifyLineSignature(rawBody, signature, secret) {
@@ -432,6 +434,7 @@ async function handleLineEvent(event) {
   }
 
   const typeLabel = messageType || event.type || "unknown";
+  console.log(`[event] fingerprint=${BUILD_FINGERPRINT} eventId=${eventId} type=${typeLabel}`);
   console.log(`[flow] eventId=${eventId} type=${typeLabel} branch=${branch} replied=${replySender.hasReplied()}`);
 }
 
