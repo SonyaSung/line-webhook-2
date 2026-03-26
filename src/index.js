@@ -275,9 +275,19 @@ function logAiSkipped(reason) {
 }
 
 function buildPrompt({ userText, imageOcrText }) {
+  const now = new Intl.DateTimeFormat("zh-TW", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    weekday: "long",
+  }).format(new Date());
   const parts = [
     "你是 LINE 助手，請直接回答問題，避免空泛寒暄與重複。",
     "若使用者要求可直接傳送的內容，請直接給成品。",
+    `目前時間（台北）：${now}。若使用者詢問天氣、黃曆、農曆、天干地支等即時資訊，請使用 Google Search 搜尋取得最新資料後再回答。`,
   ];
   if (imageOcrText) {
     parts.push(`圖片 OCR 內容：${imageOcrText}`);
@@ -287,7 +297,6 @@ function buildPrompt({ userText, imageOcrText }) {
   }
   return parts.join("\n");
 }
-
 function localFallbackReply({ userText, imageOcrText, retryNoEcho = false }) {
   if (imageOcrText && imageOcrText.trim()) {
     const summary = imageOcrText.slice(0, 220).replace(/\s+/g, " ").trim();
@@ -336,15 +345,17 @@ async function callGemini({ prompt, model, apiKey }) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model
   )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const requestBody = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.4 },
+    tools: [{ google_search: {} }],
+  };
   const resp = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.4 },
-    }),
+    body: JSON.stringify(requestBody),
   });
   if (!resp.ok) {
     const body = await resp.text();
@@ -365,7 +376,6 @@ async function callGemini({ prompt, model, apiKey }) {
     .trim();
   return text;
 }
-
 async function runAiGeneration({ userText, imageOcrText, retryNoEcho = false }) {
   const started = Date.now();
   const prompt = buildPrompt({ userText, imageOcrText });
